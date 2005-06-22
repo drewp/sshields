@@ -1,0 +1,207 @@
+#!/usr/bin/env python
+
+import sched, time, re, logging, os
+from HeapQueue import HeapQueue
+import Tailer
+
+def setuplogger(level=logging.INFO):
+    log = logging.getLogger()
+    log.setLevel(logging.INFO)
+
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s %(message)s"))
+    log.addHandler(h)
+
+    return log
+
+log = setuplogger()
+
+# Nov  3 03:23:03 bird in.identd[5410]: reply to 128.151.224.17: 33269 , 110 : USERID : UNIX :dmcc
+messages_re = re.compile(r'(?P<month>\w+) (?P<day>.\d+) (?P<time>\d\d:(\d\d):\d\d) (?P<host>\S+) (?P<service>\S+?)\[(?P<pid>\d+)\]: (?P<message>.*)')
+
+scores = ((r'Failed (?P<method>\S+) for (?P<user>\S+) from (?P<host>\S+)', 1),
+    (r'Failed (?P<method>\S+) for illegal user (?P<user>\S+) '
+      'from (?P<host>\S+)', 1),
+    (r'Illegal user (?P<user>\S+) from (?P<host>\S+)', 2),
+    (r'Did not receive identification string from (?P<host>\S+)', 8),
+    (r'scanned from (?P<host>\S+) with (?P<scanner>.*)', 50))
+
+scores = [(re.compile(regex), score) for regex, score in scores]
+
+class Attacker:
+    def __init__(self, ip, attackevents):
+        self.host = ip
+        self.attackevents = attackevents
+        self.unblock_sched_key = None
+        # TODO: lookup name, whois, geo?
+    def add_event(self, event):
+        self.attackevents.append(event)
+    def expire_event(self, event):
+        self.attackevents.remove(event)
+    def calc_score(self):
+        # a simple metric for now, might want to make
+        # many-attacks-in-1-second result in a higher score
+        return sum([event.score for event in self.attackevents])
+
+class AttackEvent:
+    """An event of a single attack.  They sort by their times."""
+    def __init__(self, eventtime, host, score=1):
+        self.time = eventtime
+        self.host = host
+        self.score = score
+    def __float__(self):
+        return self.time
+
+class BadHostCounter:
+    """We store items of the form (lastattacktime, score, host) in the queue.
+    Score is typically 1 but some things (for example root password or
+    frequent attacks can increase it).  Thus, we'll drop items that are too
+    old or haven't really attacked us much."""
+    def __init__(self, maxlength=1000):
+        self.maxlength = maxlength
+        self.queue = HeapQueue()
+        self.hosts = {} # IP : Attacker objects
+
+    # queue maintenance
+    def cleanup_queue(self):
+        self.remove_extra_events()
+        self.remove_old_events()
+    def remove_extra_events(self):
+        """Ensures that we have at most maxlength entries in the queue."""
+        while len(self.queue) > self.maxlength:
+            self.pop_event()
+    def remove_old_events(self, maxage=60 * 60 * 24 * 3):
+        """Removes any entries in the queue which are too old.  maxage is
+        in seconds, default is 3 days."""
+        now = time.time()
+        while 1:
+            try:
+                lasttime = float(self.queue.peek())
+            except IndexError:
+                break
+
+            if (now - lasttime) >= maxage:
+                self.pop_event()
+            else:
+                break
+    def pop_event(self):
+        """This should be the only call to self.queue.pop() as it performs
+        some extra maintenance to tell the Attacker that the event has
+        been removed."""
+        event = self.queue.pop()
+        host = event.host
+        attacker = self.hosts[host]
+        attacker.expire_event(event)
+
+        log.info("Expired attack from %s, new score: %s points." % \
+            (host, attacker.calc_score()))
+
+    # when we see a new event
+    def add_attackevent(self, attackevent):
+        self.queue.add(attackevent)
+        host = attackevent.host
+        if host in self.hosts:
+            attacker = self.hosts[host]
+            attacker.add_event(attackevent)
+        else:
+            attacker = Attacker(host, [attackevent])
+            self.hosts[host] = attacker
+
+        return attacker
+
+class Blocker:
+    def __init__(self, options):
+        self.options = options
+        self.log_tailer = Tailer.TailedFile(options.ssh_log_filename)
+        self.sched = sched.scheduler(time.time, time.sleep)
+        
+        self.bad_hosts = BadHostCounter()
+
+        self.poll_logfile() # this will cause poll_logfile to be regularly
+                            # enqueued in the scheduler
+        self.sched.run()
+
+    def poll_logfile(self):
+        newtext = self.log_tailer.poll()
+        if newtext is not None:
+            self.process_new_messages(newtext)
+
+        self.bad_hosts.cleanup_queue()
+        self.sched.enter(self.options.poll_interval, 1, self.poll_logfile, [])
+    def process_new_messages(self, newtext):
+        lines = newtext.splitlines()
+        for line in lines:
+            match = messages_re.match(line)
+            if match:
+                d = match.groupdict()
+                if d['service'] == 'sshd':
+                    self.analyze_message(d)
+    def analyze_message(self, message_dict):
+        # there are 3 types of messages that we care about
+        message = message_dict['message']
+        for regex, points in scores:
+            match = regex.search(message)
+            if match:
+                host = match.group('host')
+                try: # attacks against root will get you killed really fast
+                     # since we don't allow root login
+                    user = match.group('user')
+                    if user in ('root', 'admin'):
+                        points += 5
+                except IndexError:
+                    pass
+                now = time.time()
+                event = AttackEvent(now, host, points)
+                attacker = self.bad_hosts.add_attackevent(event)
+                total_score = attacker.calc_score()
+                self.consider_blocking(attacker, total_score)
+                log.info("Attack: %r" % message)
+                log.warn("Attack from %s for %s point(s).  Total score: %s" % \
+                    (host, points, total_score))
+                break
+    def consider_blocking(self, attacker, score):
+        if score >= self.options.score_to_block:
+            self.block_ip(attacker)
+
+            # if we already scheduled an unblock, we cancel it since we'll
+            # add a later one
+            if attacker.unblock_sched_key is not None:
+                self.sched.cancel(attacker.unblock_sched_key)
+
+            unblock_sched_key = self.sched.enter(self.options.block_period, 
+                2, self.unblock_ip, [attacker])
+            attacker.unblock_sched_key = unblock_sched_key
+    def block_ip(self, attacker):
+        log.error("Blocking host %s." % attacker.host)
+        os.system("iptables -I INPUT -s %s -j DROP" % attacker.host)
+    def unblock_ip(self, attacker):
+        log.error("Unblocking host %s." % attacker.host)
+        attacker.unblock_sched_key = None
+        os.system("iptables -D INPUT -s %s -j DROP" % attacker.host)
+
+if __name__ == "__main__":
+    from optparse import OptionParser
+    parser = OptionParser()
+
+    parser.add_option("-i", "--poll-interval", type='float', default=2,
+        metavar='SECONDS', help="How often to poll the log file (default: 2 "
+        "seconds)")
+    parser.add_option("-l", "--ssh-log-filename", default='/var/log/messages',
+        metavar='FILE', help="Filename of log where ssh messages go "
+        "(default: /var/log/messages)")
+    parser.add_option("-s", "--score-to-block", type='float', default=10, 
+        metavar='POINTS', help="Number of points needed before we block an IP "
+        "(default: 10)")
+    parser.add_option("-b", "--block-period", type='float', 
+        default=15 * 60, metavar='SECONDS', help="How long someone will be"
+        "blocked for (default: 15 minutes)")
+    parser.add_option("-m", "--memory", type='float', 
+        default=60 * 60 * 24 * 3, metavar='SECONDS',
+        help="Seconds to remember attack events for (default: 3 days.")
+
+    options, args = parser.parse_args()
+    if args and not options.ssh_log_filename:
+        options.ssh_log_filename = args[0]
+
+    print "Options:", options
+    b = Blocker(options)
