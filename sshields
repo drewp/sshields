@@ -146,8 +146,8 @@ class Blocker:
                 try: # attacks against root will get you killed really fast
                      # since we don't allow root login
                     user = match.group('user')
-                    if user in ('root', 'admin'):
-                        points += 5
+                    if user in ('root', 'admin', 'adm', 'www', 'pop'):
+                        points += 50
                 except IndexError:
                     pass
                 now = time.time()
@@ -183,8 +183,8 @@ if __name__ == "__main__":
     from optparse import OptionParser
     parser = OptionParser()
 
-    parser.add_option("-i", "--poll-interval", type='float', default=2,
-        metavar='SECONDS', help="How often to poll the log file (default: 2 "
+    parser.add_option("-i", "--poll-interval", type='float', default=1,
+        metavar='SECONDS', help="How often to poll the log file (default: 1 "
         "seconds)")
     parser.add_option("-l", "--ssh-log-filename", default='/var/log/messages',
         metavar='FILE', help="Filename of log where ssh messages go "
